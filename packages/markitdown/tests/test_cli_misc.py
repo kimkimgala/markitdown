@@ -123,6 +123,221 @@ def test_directory_conversion_skips_unconvertible_files(tmp_path) -> None:
     assert "SKIPPED" in result.stderr
 
 
+def test_directory_conversion_empty_folder(tmp_path) -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "markitdown", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"CLI exited with error: {result.stderr}"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_directory_conversion_aborts_on_output_collision(tmp_path) -> None:
+    # report.pdf and report.docx would both convert to report.md.
+    (tmp_path / "report.pdf").write_text("dummy pdf content")
+    (tmp_path / "report.docx").write_text("dummy docx content")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "markitdown", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    # Nothing should have been converted: the collision is caught up front.
+    assert not (tmp_path / "report.md").exists()
+    combined_output = result.stdout + result.stderr
+    assert "report.pdf" in combined_output
+    assert "report.docx" in combined_output
+    assert "report.md" in combined_output
+
+
+def test_directory_conversion_case_insensitive_collision(tmp_path) -> None:
+    # On a case-insensitive filesystem (as is typical on Windows), Report.PDF
+    # and report.pdf would collide with each other's ".md" output too.
+    (tmp_path / "Report.PDF").write_text("dummy pdf content")
+    (tmp_path / "report.pdf").write_text("dummy pdf content")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "markitdown", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+
+    if sys.platform.startswith("win") or sys.platform == "darwin":
+        # On a case-insensitive filesystem, Report.md and report.md are the
+        # same path, so both inputs collide on one real output file.
+        assert result.returncode != 0
+        combined_output = result.stdout + result.stderr
+        assert "Report.md" in combined_output or "report.md" in combined_output
+    else:
+        # On a case-sensitive filesystem, Report.md and report.md are
+        # distinct files, so both inputs convert independently.
+        assert result.returncode == 0, f"CLI exited with error: {result.stderr}"
+
+
+def test_directory_conversion_default_does_not_overwrite(tmp_path) -> None:
+    (tmp_path / "a.html").write_text("<html><body><h1>Hello</h1></body></html>")
+    (tmp_path / "a.md").write_text("pre-existing content, must survive")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "markitdown", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "a.md").read_text() == "pre-existing content, must survive"
+    assert "SKIPPED" in result.stderr
+    assert "already exists" in result.stderr
+
+
+def test_directory_conversion_overwrite_flag_replaces_existing(tmp_path) -> None:
+    (tmp_path / "a.html").write_text("<html><body><h1>Hello</h1></body></html>")
+    (tmp_path / "a.md").write_text("stale content, should be replaced")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "markitdown", str(tmp_path), "--overwrite"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"CLI exited with error: {result.stderr}"
+    assert (tmp_path / "a.md").read_text().strip() == "# Hello"
+
+
+def test_directory_conversion_rerun_is_stable(tmp_path) -> None:
+    (tmp_path / "a.html").write_text("<html><body><h1>Hello</h1></body></html>")
+
+    first = subprocess.run(
+        [sys.executable, "-m", "markitdown", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert first.returncode == 0, f"CLI exited with error: {first.stderr}"
+    assert (tmp_path / "a.md").read_text().strip() == "# Hello"
+
+    # Re-running without --overwrite must not touch the .md file, and
+    # crucially must not treat a.md as a new input file to convert either.
+    second = subprocess.run(
+        [sys.executable, "-m", "markitdown", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert second.returncode != 0  # a.md already exists, skipped -> failed count
+    assert (tmp_path / "a.md").read_text().strip() == "# Hello"
+    assert "SKIPPED" in second.stderr
+
+
+def test_directory_conversion_write_error_continues_and_reports(tmp_path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    (input_dir / "sub").mkdir(parents=True)
+    (input_dir / "sub" / "a.html").write_text(
+        "<html><body><h1>Hello</h1></body></html>"
+    )
+    (input_dir / "ok.html").write_text("<html><body><h1>OK</h1></body></html>")
+
+    output_dir.mkdir()
+    # Create a *file* named "sub" inside the output directory, so that
+    # creating the "sub" output subdirectory for sub/a.html fails.
+    (output_dir / "sub").write_text("I am a file, not a directory")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "markitdown",
+            str(input_dir),
+            "-o",
+            str(output_dir),
+            "-r",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    # The failing file should not stop the other file from being converted.
+    assert result.returncode != 0
+    assert (output_dir / "ok.md").read_text().strip() == "# OK"
+    assert not (output_dir / "sub" / "a.md").exists()
+    assert "SKIPPED" in result.stderr
+
+
+def test_directory_conversion_output_dir_inside_input_dir_not_reconverted(
+    tmp_path,
+) -> None:
+    input_dir = tmp_path
+    output_dir = tmp_path / "converted"
+    (input_dir / "a.html").write_text("<html><body><h1>Hello</h1></body></html>")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "markitdown",
+            str(input_dir),
+            "-o",
+            str(output_dir),
+            "-r",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"CLI exited with error: {result.stderr}"
+    assert (output_dir / "a.md").read_text().strip() == "# Hello"
+    # The freshly-written output/a.md must not have been picked back up and
+    # converted again into output/converted/a.md.
+    assert not (output_dir / "converted").exists()
+
+
+def test_directory_conversion_existing_markdown_not_self_overwritten(
+    tmp_path,
+) -> None:
+    (tmp_path / "already.md").write_text("# Already markdown\n")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "markitdown", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"CLI exited with error: {result.stderr}"
+    assert (tmp_path / "already.md").read_text() == "# Already markdown\n"
+
+
+def test_single_file_conversion_still_overwrites_without_flag(tmp_path) -> None:
+    # The batch --overwrite protection must not affect single-file mode.
+    src = tmp_path / "a.html"
+    src.write_text("<html><body><h1>Hello</h1></body></html>")
+    dest = tmp_path / "out.md"
+    dest.write_text("stale content")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "markitdown", str(src), "-o", str(dest)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"CLI exited with error: {result.stderr}"
+    assert dest.read_text().strip() == "# Hello"
+
+
+def test_stdin_conversion_still_works(tmp_path) -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "markitdown"],
+        input="<html><body><h1>Hello</h1></body></html>",
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"CLI exited with error: {result.stderr}"
+    assert result.stdout.strip() == "# Hello"
+
+
 if __name__ == "__main__":
     """Runs this file's tests from the command line."""
     test_version()

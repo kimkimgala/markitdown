@@ -6,6 +6,7 @@ import os
 import sys
 import codecs
 import io
+import tempfile
 from typing import Any, Dict, List, Tuple
 from textwrap import dedent
 from importlib.metadata import entry_points
@@ -53,6 +54,10 @@ def main():
                 OR, to also recurse into subfolders
 
                 markitdown path-to-folder -o path-to-output-folder -r
+
+                OR, to overwrite existing output files when batch-converting
+
+                markitdown path-to-folder -o path-to-output-folder --overwrite
             """
         ).strip(),
     )
@@ -80,6 +85,15 @@ def main():
         "--recursive",
         action="store_true",
         help="When FILENAME is a directory, also convert files in its subdirectories.",
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "When FILENAME is a directory, overwrite output .md files that "
+            "already exist. By default, existing output files are skipped."
+        ),
     )
 
     parser.add_argument(
@@ -292,22 +306,35 @@ def main():
     _handle_output(args, result)
 
 
+def _normalize_path(path: str) -> str:
+    """Normalize a path for cross-platform equality/collision comparisons.
+
+    Resolves symlinks and '..'/'.' segments (realpath, which is safe to call
+    on paths that don't exist yet) and case-folds the result (normcase), so
+    that two paths referring to the same file -- including via a symlink, or
+    differing only in case on a case-insensitive filesystem such as those
+    typically used on Windows -- compare equal.
+    """
+    return os.path.normcase(os.path.realpath(path))
+
+
 def _iter_input_files(
     input_dir: str, recursive: bool, exclude_dir: str
 ) -> List[Tuple[str, str]]:
-    """Yield (absolute_path, path_relative_to_input_dir) for files under input_dir.
+    """Return (absolute_path, path_relative_to_input_dir) for files under input_dir.
 
     exclude_dir (e.g. the output directory) is pruned from the walk so that
-    freshly-written output files are never picked back up as input.
+    output files -- whether written by a previous run or created earlier in
+    this same run -- are never picked back up as input.
     """
-    abs_exclude_dir = os.path.abspath(exclude_dir)
+    norm_exclude_dir = _normalize_path(exclude_dir)
     results = []
     if recursive:
         for dirpath, dirnames, filenames in os.walk(input_dir):
             dirnames[:] = [
                 d
                 for d in dirnames
-                if os.path.abspath(os.path.join(dirpath, d)) != abs_exclude_dir
+                if _normalize_path(os.path.join(dirpath, d)) != norm_exclude_dir
             ]
             for filename in sorted(filenames):
                 full_path = os.path.join(dirpath, filename)
@@ -320,39 +347,126 @@ def _iter_input_files(
     return results
 
 
+def _build_conversion_plan(
+    input_dir: str, output_dir: str, recursive: bool
+) -> List[Tuple[str, str]]:
+    """Pair up input files with their planned .md output path.
+
+    If two or more distinct input files would map to the same output path,
+    conversion is aborted before anything is written: partially overwriting
+    one of them and not the other, depending on processing order, would be
+    surprising and hard to detect. A file that is already its own output
+    (an existing .md file sitting where it would be "converted" to) is not
+    counted here -- it is a no-op, handled later in _convert_directory -- so
+    that an existing .md file does not itself register as a false collision.
+    """
+    plan = []
+    # normalized output path -> (display output path, [input paths])
+    by_output: Dict[str, Tuple[str, List[str]]] = {}
+    for input_path, rel_path in _iter_input_files(input_dir, recursive, output_dir):
+        rel_md_path = os.path.splitext(rel_path)[0] + ".md"
+        output_path = os.path.join(output_dir, rel_md_path)
+        plan.append((input_path, output_path))
+
+        if _normalize_path(input_path) == _normalize_path(output_path):
+            continue
+
+        key = _normalize_path(output_path)
+        display_path, inputs = by_output.get(key, (output_path, []))
+        inputs.append(input_path)
+        by_output[key] = (display_path, inputs)
+
+    collisions = {key: value for key, value in by_output.items() if len(value[1]) > 1}
+    if collisions:
+        lines = [
+            "Refusing to convert: multiple input files would be written to the "
+            "same output file. No files were converted. Rename the inputs, "
+            "move them into separate folders, or convert them separately.",
+        ]
+        for display_path, inputs in collisions.values():
+            lines.append(f"  {display_path}")
+            for input_path in inputs:
+                lines.append(f"    <- {input_path}")
+        _exit_with_error("\n".join(lines))
+
+    return plan
+
+
+def _atomic_write(path: str, content: str) -> None:
+    """Write content to path, avoiding a partially-written file on failure."""
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".markitdown-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def _convert_directory(markitdown: MarkItDown, args) -> None:
     """Convert every file in args.filename (a directory) to a .md file."""
     input_dir = args.filename
     output_dir = args.output if args.output else input_dir
-    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as e:
+        _exit_with_error(f"Could not create output directory {output_dir}: {e}")
+
+    plan = _build_conversion_plan(input_dir, output_dir, args.recursive)
 
     converted = 0
     failed = 0
-    for input_path, rel_path in _iter_input_files(
-        input_dir, args.recursive, output_dir
-    ):
-        rel_md_path = os.path.splitext(rel_path)[0] + ".md"
-        output_path = os.path.join(output_dir, rel_md_path)
-
-        if os.path.abspath(input_path) == os.path.abspath(output_path):
+    skipped = 0
+    for input_path, output_path in plan:
+        if _normalize_path(input_path) == _normalize_path(output_path):
             # Input file is already the intended output (e.g., converting a
-            # folder of .md files in place); nothing to do.
+            # folder that already contains .md files, in place). Since the
+            # collision check above guarantees no other input targets this
+            # same output path, it is safe to leave it untouched.
+            skipped += 1
+            continue
+
+        if os.path.exists(output_path) and not args.overwrite:
+            print(
+                f"[SKIPPED] {input_path}: output file already exists: "
+                f"{output_path} (use --overwrite to replace it)",
+                file=sys.stderr,
+            )
+            failed += 1
             continue
 
         try:
             result = markitdown.convert(input_path, keep_data_uris=args.keep_data_uris)
         except Exception as e:
-            print(f"[SKIPPED] {input_path}: {e}", file=sys.stderr)
+            print(f"[SKIPPED] {input_path}: conversion failed: {e}", file=sys.stderr)
             failed += 1
             continue
 
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(result.markdown)
+        try:
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            _atomic_write(output_path, result.markdown)
+        except OSError as e:
+            print(
+                f"[SKIPPED] {input_path}: failed to write {output_path}: {e}",
+                file=sys.stderr,
+            )
+            failed += 1
+            continue
+
         print(f"{input_path} -> {output_path}")
         converted += 1
 
-    print(f"\nConverted {converted} file(s), {failed} failed.", file=sys.stderr)
+    print(
+        f"\nConverted {converted} file(s), {failed} failed, {skipped} skipped "
+        "(already up to date).",
+        file=sys.stderr,
+    )
     if failed > 0:
         sys.exit(1)
 

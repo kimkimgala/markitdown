@@ -101,7 +101,16 @@ By default, the `.md` files are written next to the originals. Use `-o` to write
 markitdown path-to-folder -o path-to-output-folder -r
 ```
 
-Files that fail to convert are skipped (a message is printed to stderr) rather than stopping the whole batch.
+**Safety behavior of folder conversion:**
+
+* **Output collisions abort the batch.** Before converting anything, markitdown checks whether two different input files would produce the same output path (e.g. `report.pdf` and `report.docx` both becoming `report.md`). If so, it exits with an error listing the conflicting files and converts nothing — it never guesses which one should "win". Rename the files, put them in separate folders, or convert them separately instead. (This check is case-insensitive, so it also catches names that only differ by case, which would collide on Windows.)
+* **Existing output files are not overwritten by default.** If `report.md` already exists, converting `report.pdf` into it is skipped with a message on stderr, so re-running the same command is safe and won't clobber prior output (or hand-edited files). Pass `--overwrite` to replace existing output files instead.
+* **Existing `.md` files in the input folder are left alone.** They are still scanned like any other file, but since converting a Markdown file to Markdown would just write it to itself, that's treated as a no-op rather than a self-overwrite (or an error).
+* **Files that fail to convert are skipped**, not fatal: a message naming the file and the error is printed to stderr, and the rest of the batch continues.
+* **The process exits with status `1`** if any file was skipped due to a conversion error or an existing output file (with `--overwrite` not passed); it exits `0` only if every file converted (or was correctly left alone as a no-op).
+* If `-o` points to a folder nested inside the input folder, that output folder is excluded from the scan, so freshly written `.md` files are never picked back up and converted again in the same run.
+
+None of the above applies to single-file conversion (`markitdown file.pdf -o out.md`) or stdin conversion, which keep their original behavior of always writing/overwriting the given output.
 
 ### Optional Dependencies
 MarkItDown has optional dependencies for activating various file formats. Earlier in this document, we installed all optional dependencies with the `[all]` option. However, you can also install them individually for more control. For example:
