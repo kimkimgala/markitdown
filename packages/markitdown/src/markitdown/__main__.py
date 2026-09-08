@@ -307,13 +307,21 @@ def main():
 
 
 def _normalize_path(path: str) -> str:
-    """Normalize a path for cross-platform equality/collision comparisons.
+    """Normalize a path for equality/collision comparisons.
 
     Resolves symlinks and '..'/'.' segments (realpath, which is safe to call
-    on paths that don't exist yet) and case-folds the result (normcase), so
-    that two paths referring to the same file -- including via a symlink, or
-    differing only in case on a case-insensitive filesystem such as those
-    typically used on Windows -- compare equal.
+    on paths that don't exist yet), then case-folds the result (normcase).
+
+    normcase is only a real case fold on Windows -- that's how the Python
+    standard library itself defines it, not a choice made here -- so two
+    paths differing only by case compare equal via this function precisely
+    when running on Windows. On Linux this is moot (filenames differing
+    only by case are simply different files on the usual case-sensitive
+    filesystems there). On macOS, whose default filesystem is normally
+    case-insensitive despite normcase not folding case, a same-file-only-
+    by-case pair will NOT compare equal here even though the filesystem
+    itself would treat them as one file; see the "Batch-Converting a
+    Folder" section of the README for what that means in practice.
     """
     return os.path.normcase(os.path.realpath(path))
 

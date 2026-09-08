@@ -1,5 +1,6 @@
 #!/usr/bin/env python3 -m pytest
 import io
+import os
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -154,9 +155,80 @@ def test_directory_conversion_aborts_on_output_collision(tmp_path) -> None:
     assert "report.md" in combined_output
 
 
-def test_directory_conversion_case_insensitive_collision(tmp_path) -> None:
-    # On a case-insensitive filesystem (as is typical on Windows), Report.PDF
-    # and report.pdf would collide with each other's ".md" output too.
+def test_directory_conversion_collision_detected_even_with_overwrite(tmp_path) -> None:
+    # report.pdf and report.docx both target report.md, which also already
+    # exists on disk. Even with --overwrite, this must still be reported as
+    # a collision between two different inputs rather than silently letting
+    # one of them win: --overwrite only controls replacing an existing file
+    # for a *single* input, not picking a winner between competing inputs.
+    (tmp_path / "report.pdf").write_text("dummy pdf content")
+    (tmp_path / "report.docx").write_text("dummy docx content")
+    (tmp_path / "report.md").write_text("pre-existing content, must survive")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "markitdown", str(tmp_path), "--overwrite"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "report.md").read_text() == "pre-existing content, must survive"
+    combined_output = result.stdout + result.stderr
+    assert "report.pdf" in combined_output
+    assert "report.docx" in combined_output
+
+
+def test_directory_conversion_existing_markdown_protected_from_other_input(
+    tmp_path,
+) -> None:
+    # A single input (report.pdf) whose target (report.md) already exists
+    # is the "protect existing output" case, not a collision: only one
+    # input is competing for that output path, so the fix is --overwrite,
+    # not renaming files.
+    (tmp_path / "report.pdf").write_text("dummy pdf content")
+    (tmp_path / "report.md").write_text("hand-written report, must survive")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "markitdown", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "report.md").read_text() == "hand-written report, must survive"
+    assert "SKIPPED" in result.stderr
+    assert "already exists" in result.stderr
+
+
+def test_directory_conversion_existing_markdown_replaced_with_overwrite(
+    tmp_path,
+) -> None:
+    (tmp_path / "report.pdf").write_text("dummy pdf content")
+    (tmp_path / "report.md").write_text("stale content, should be replaced")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "markitdown", str(tmp_path), "--overwrite"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"CLI exited with error: {result.stderr}"
+    assert (tmp_path / "report.md").read_text() == "dummy pdf content"
+
+
+def test_directory_conversion_case_only_names_on_this_platform(tmp_path) -> None:
+    # Report.PDF and report.pdf would both produce a ".md" output that
+    # differs only in case ("Report.md" vs "report.md"). Whether that's a
+    # real collision depends on the platform actually running this test:
+    # Python's os.path.normcase() -- which the collision check relies on --
+    # is documented to fold case only on Windows, so this pre-flight check
+    # only ever treats the two as colliding there. On every other platform
+    # (including this test's own, when run on Linux or macOS CI), the check
+    # sees them as distinct and lets both convert. See
+    # test_normalize_path_folds_case_only_like_windows_would below for a
+    # platform-independent check of that same normcase-based logic, and the
+    # README's "Batch-Converting a Folder" section for what this means in
+    # practice on a case-insensitive filesystem such as default macOS.
     (tmp_path / "Report.PDF").write_text("dummy pdf content")
     (tmp_path / "report.pdf").write_text("dummy pdf content")
 
@@ -166,16 +238,52 @@ def test_directory_conversion_case_insensitive_collision(tmp_path) -> None:
         text=True,
     )
 
-    if sys.platform.startswith("win") or sys.platform == "darwin":
-        # On a case-insensitive filesystem, Report.md and report.md are the
-        # same path, so both inputs collide on one real output file.
+    if sys.platform.startswith("win"):
         assert result.returncode != 0
         combined_output = result.stdout + result.stderr
         assert "Report.md" in combined_output or "report.md" in combined_output
     else:
-        # On a case-sensitive filesystem, Report.md and report.md are
-        # distinct files, so both inputs convert independently.
         assert result.returncode == 0, f"CLI exited with error: {result.stderr}"
+        assert (tmp_path / "Report.md").exists()
+        assert (tmp_path / "report.md").exists()
+
+
+def test_normalize_path_folds_case_only_like_windows_would(
+    monkeypatch, tmp_path
+) -> None:
+    # Exercise the actual case-folding behavior the collision check relies
+    # on without needing a real Windows machine: os.path.normcase() folds
+    # case only on Windows (ntpath.normcase), and is a documented no-op
+    # everywhere else (posixpath.normcase). This asserts that contract
+    # directly, on whatever OS is running the test.
+    #
+    # os.path *is* posixpath (or ntpath) -- the very same module object, not
+    # a copy -- so patching os.path.normcase also mutates posixpath.normcase
+    # itself. The original function reference is captured up front, before
+    # any patching, so the "no-op on POSIX" assertion below isn't checking
+    # against an already-patched function.
+    import ntpath
+
+    from markitdown.__main__ import _normalize_path
+
+    original_normcase = os.path.normcase
+    a = str(tmp_path / "Report.md")
+    b = str(tmp_path / "report.md")
+
+    assert original_normcase(a) != original_normcase(b), (
+        "this test assumes it runs on a platform (e.g. Linux CI) where "
+        "os.path.normcase is the documented POSIX no-op"
+    )
+    assert _normalize_path(a) != _normalize_path(b), (
+        "posixpath.normcase is documented as a no-op, so on POSIX this "
+        "check must NOT treat case-only-differing paths as equal"
+    )
+
+    monkeypatch.setattr(os.path, "normcase", ntpath.normcase)
+    assert _normalize_path(a) == _normalize_path(b), (
+        "normcase is documented to fold case on Windows, so the collision "
+        "check must treat case-only-differing paths as equal there"
+    )
 
 
 def test_directory_conversion_default_does_not_overwrite(tmp_path) -> None:
