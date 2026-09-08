@@ -5,6 +5,8 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from markitdown import __version__
 from markitdown.__main__ import main
 
@@ -219,16 +221,18 @@ def test_directory_conversion_existing_markdown_replaced_with_overwrite(
 def test_directory_conversion_case_only_names_on_this_platform(tmp_path) -> None:
     # Report.PDF and report.pdf would both produce a ".md" output that
     # differs only in case ("Report.md" vs "report.md"). Whether that's a
-    # real collision depends on the platform actually running this test:
-    # Python's os.path.normcase() -- which the collision check relies on --
-    # is documented to fold case only on Windows, so this pre-flight check
-    # only ever treats the two as colliding there. On every other platform
-    # (including this test's own, when run on Linux or macOS CI), the check
-    # sees them as distinct and lets both convert. See
-    # test_normalize_path_folds_case_only_like_windows_would below for a
-    # platform-independent check of that same normcase-based logic, and the
-    # README's "Batch-Converting a Folder" section for what this means in
-    # practice on a case-insensitive filesystem such as default macOS.
+    # real collision is now determined by actually probing tmp_path's
+    # filesystem (_filesystem_is_case_insensitive), not by assuming it from
+    # the OS name. This test still branches on sys.platform because it
+    # can't control which filesystem CI actually mounts tmp_path on -- but
+    # it's asserting against each platform's typical default filesystem
+    # (NTFS on Windows, APFS/HFS+ on macOS: both case-insensitive by
+    # default; most Linux filesystems: case-sensitive), which the probe is
+    # now expected to detect correctly on all three, including macOS --
+    # previously a blind spot documented as undetectable. See
+    # test_filesystem_is_case_insensitive_* below for platform-independent
+    # coverage of the probe itself and of the collision-detection wiring
+    # that consumes it.
     (tmp_path / "Report.PDF").write_text("dummy pdf content")
     (tmp_path / "report.pdf").write_text("dummy pdf content")
 
@@ -238,7 +242,7 @@ def test_directory_conversion_case_only_names_on_this_platform(tmp_path) -> None
         text=True,
     )
 
-    if sys.platform.startswith("win"):
+    if sys.platform.startswith("win") or sys.platform == "darwin":
         assert result.returncode != 0
         combined_output = result.stdout + result.stderr
         assert "Report.md" in combined_output or "report.md" in combined_output
@@ -246,6 +250,84 @@ def test_directory_conversion_case_only_names_on_this_platform(tmp_path) -> None
         assert result.returncode == 0, f"CLI exited with error: {result.stderr}"
         assert (tmp_path / "Report.md").exists()
         assert (tmp_path / "report.md").exists()
+
+
+def test_filesystem_is_case_insensitive_probe_on_this_platform(tmp_path) -> None:
+    # Exercises the real probe (real os.open/os.path.exists/os.path.samefile
+    # calls) against tmp_path's actual filesystem. This project's CI only
+    # runs on ubuntu-latest, whose usual filesystem (ext4, or overlayfs on
+    # top of it in a container) is case-sensitive, so that's the only
+    # branch actually exercised there; this is not verified against a real
+    # case-insensitive filesystem (default macOS, or Windows) by this test
+    # suite -- see test_filesystem_is_case_insensitive_forced_true below for
+    # how that branch is covered instead, by simulating the probe's result
+    # rather than by mounting a case-insensitive filesystem.
+    from markitdown.__main__ import _filesystem_is_case_insensitive
+
+    if sys.platform.startswith("win") or sys.platform == "darwin":
+        pytest.skip(
+            "This assertion targets Linux's typical case-sensitive default; "
+            "Windows/macOS are covered by the platform branch in "
+            "test_directory_conversion_case_only_names_on_this_platform."
+        )
+    assert _filesystem_is_case_insensitive(str(tmp_path)) is False
+
+
+def test_filesystem_is_case_insensitive_returns_false_when_probe_cannot_run(
+    tmp_path, monkeypatch
+) -> None:
+    from markitdown.__main__ import _filesystem_is_case_insensitive
+
+    def _raise(*args, **kwargs):
+        raise OSError("simulated: directory not writable")
+
+    monkeypatch.setattr(os, "open", _raise)
+    assert _filesystem_is_case_insensitive(str(tmp_path)) is False
+
+
+def test_filesystem_is_case_insensitive_forced_true(tmp_path, monkeypatch) -> None:
+    # Simulates what the probe would report on a real case-insensitive
+    # filesystem (default macOS, or Windows), without needing one: makes
+    # os.path.exists/os.path.samefile agree that the upper-cased variant of
+    # the probe file resolves to the same file, exactly as they would on
+    # such a filesystem, and confirms the probe reports that faithfully.
+    from markitdown.__main__ import _filesystem_is_case_insensitive
+
+    monkeypatch.setattr(os.path, "exists", lambda path: True)
+    monkeypatch.setattr(os.path, "samefile", lambda a, b: True)
+    assert _filesystem_is_case_insensitive(str(tmp_path)) is True
+
+
+def test_directory_conversion_collision_when_filesystem_is_case_insensitive(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    # End-to-end wiring check for the case-insensitive branch: forces
+    # _filesystem_is_case_insensitive to report True (as it would on a real
+    # case-insensitive filesystem) and confirms that Report.PDF and
+    # report.pdf are then correctly refused as a collision by the full CLI
+    # path, in-process, on this sandbox's actual (case-sensitive) Linux
+    # filesystem. This isolates "does the rest of the collision-detection
+    # logic react correctly to fold_case=True" from "does the probe itself
+    # correctly detect a real case-insensitive filesystem" (covered
+    # separately, and only on Linux, by
+    # test_filesystem_is_case_insensitive_probe_on_this_platform).
+    import markitdown.__main__ as md_main
+
+    (tmp_path / "Report.PDF").write_text("dummy pdf content")
+    (tmp_path / "report.pdf").write_text("dummy pdf content")
+
+    monkeypatch.setattr(md_main, "_filesystem_is_case_insensitive", lambda d: True)
+    monkeypatch.setattr(sys, "argv", ["markitdown", str(tmp_path)])
+
+    with pytest.raises(SystemExit) as exc_info:
+        md_main.main()
+    assert exc_info.value.code != 0
+
+    captured = capsys.readouterr()
+    combined_output = captured.out + captured.err
+    assert "Report.md" in combined_output or "report.md" in combined_output
+    assert not (tmp_path / "Report.md").exists()
+    assert not (tmp_path / "report.md").exists()
 
 
 def test_normalize_path_folds_case_only_like_windows_would(
@@ -284,6 +366,20 @@ def test_normalize_path_folds_case_only_like_windows_would(
         "normcase is documented to fold case on Windows, so the collision "
         "check must treat case-only-differing paths as equal there"
     )
+
+
+def test_normalize_path_fold_case_parameter(tmp_path) -> None:
+    # _normalize_path's fold_case parameter is the primary, filesystem-
+    # probe-driven case-folding mechanism (normcase above is a secondary,
+    # OS-name-based effect layered on top of it). This checks fold_case
+    # directly, independent of the current OS's own normcase behavior.
+    from markitdown.__main__ import _normalize_path
+
+    a = str(tmp_path / "Report.md")
+    b = str(tmp_path / "report.md")
+
+    assert _normalize_path(a, fold_case=True) == _normalize_path(b, fold_case=True)
+    assert _normalize_path(a, fold_case=False) != _normalize_path(b, fold_case=False)
 
 
 def test_directory_conversion_default_does_not_overwrite(tmp_path) -> None:

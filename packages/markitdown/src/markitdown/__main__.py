@@ -7,6 +7,7 @@ import sys
 import codecs
 import io
 import tempfile
+import uuid
 from typing import Any, Dict, List, Tuple
 from textwrap import dedent
 from importlib.metadata import entry_points
@@ -306,43 +307,94 @@ def main():
     _handle_output(args, result)
 
 
-def _normalize_path(path: str) -> str:
+def _filesystem_is_case_insensitive(directory: str) -> bool:
+    """Probe whether `directory`'s actual filesystem treats file names that
+    differ only by case as the same file.
+
+    This checks the real filesystem rather than assuming behavior from the
+    OS name: the default is case-insensitive on Windows and on macOS's
+    usual APFS/HFS+, and case-sensitive on most Linux filesystems -- but
+    any of those OSes can also be pointed at a directory backed by the
+    other kind of filesystem (an exFAT/FAT32-formatted drive, an SMB/CIFS
+    share, a case-sensitive-enabled NTFS folder on modern Windows, etc.),
+    so relying on the OS name alone would both over- and under-detect.
+
+    The probe creates a single, uniquely-named empty file directly inside
+    `directory`, checks whether an upper-cased variant of that same name
+    resolves to it too, and removes it again -- it never reads, creates,
+    or removes any other file, so pre-existing files (including ones
+    already scheduled for conversion) are never touched. On any failure
+    (directory not writable, a permissions error, etc.) this conservatively
+    returns False, i.e. "assume case-sensitive, do not fold case" -- which
+    only means an unlikely, environment-specific collision might be missed
+    if the probe itself couldn't run, never that two genuinely distinct
+    files get incorrectly treated as colliding.
+    """
+    probe_name = f".markitdown-case-probe-{uuid.uuid4().hex}"
+    probe_path = os.path.join(directory, probe_name)
+    variant_path = os.path.join(directory, probe_name.upper())
+    if probe_path == variant_path:
+        # Not reachable in practice (the ".markitdown-case-probe-" prefix
+        # always supplies letters for upper() to change), but avoid ever
+        # comparing a path against itself and calling that "insensitive".
+        return False
+
+    try:
+        fd = os.open(probe_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except OSError:
+        return False
+
+    try:
+        return os.path.exists(variant_path) and os.path.samefile(
+            probe_path, variant_path
+        )
+    except OSError:
+        return False
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
+
+
+def _normalize_path(path: str, fold_case: bool = False) -> str:
     """Normalize a path for equality/collision comparisons.
 
-    Resolves symlinks and '..'/'.' segments (realpath, which is safe to call
-    on paths that don't exist yet), then case-folds the result (normcase).
-
-    normcase is only a real case fold on Windows -- that's how the Python
-    standard library itself defines it, not a choice made here -- so two
-    paths differing only by case compare equal via this function precisely
-    when running on Windows. On Linux this is moot (filenames differing
-    only by case are simply different files on the usual case-sensitive
-    filesystems there). On macOS, whose default filesystem is normally
-    case-insensitive despite normcase not folding case, a same-file-only-
-    by-case pair will NOT compare equal here even though the filesystem
-    itself would treat them as one file; see the "Batch-Converting a
-    Folder" section of the README for what that means in practice.
+    Resolves symlinks and '..'/'.' segments (realpath, which is safe to
+    call on paths that don't exist yet), applies Python's own case-folding
+    (normcase, which is a real case fold on Windows and a no-op on POSIX),
+    and additionally folds case when the caller has determined -- e.g. via
+    _filesystem_is_case_insensitive on the actual output directory -- that
+    doing so matches the real filesystem's own behavior. Without fold_case,
+    this matches paths the way the OS's own path-comparison conventions
+    would (case-insensitively on Windows, case-sensitively elsewhere).
     """
-    return os.path.normcase(os.path.realpath(path))
+    normalized = os.path.normcase(os.path.realpath(path))
+    if fold_case:
+        normalized = normalized.lower()
+    return normalized
 
 
 def _iter_input_files(
-    input_dir: str, recursive: bool, exclude_dir: str
+    input_dir: str, recursive: bool, exclude_dir: str, fold_case: bool
 ) -> List[Tuple[str, str]]:
     """Return (absolute_path, path_relative_to_input_dir) for files under input_dir.
 
     exclude_dir (e.g. the output directory) is pruned from the walk so that
     output files -- whether written by a previous run or created earlier in
-    this same run -- are never picked back up as input.
+    this same run -- are never picked back up as input. fold_case is passed
+    straight through to _normalize_path for that comparison.
     """
-    norm_exclude_dir = _normalize_path(exclude_dir)
+    norm_exclude_dir = _normalize_path(exclude_dir, fold_case)
     results = []
     if recursive:
         for dirpath, dirnames, filenames in os.walk(input_dir):
             dirnames[:] = [
                 d
                 for d in dirnames
-                if _normalize_path(os.path.join(dirpath, d)) != norm_exclude_dir
+                if _normalize_path(os.path.join(dirpath, d), fold_case)
+                != norm_exclude_dir
             ]
             for filename in sorted(filenames):
                 full_path = os.path.join(dirpath, filename)
@@ -356,7 +408,7 @@ def _iter_input_files(
 
 
 def _build_conversion_plan(
-    input_dir: str, output_dir: str, recursive: bool
+    input_dir: str, output_dir: str, recursive: bool, fold_case: bool
 ) -> List[Tuple[str, str]]:
     """Pair up input files with their planned .md output path.
 
@@ -367,19 +419,28 @@ def _build_conversion_plan(
     (an existing .md file sitting where it would be "converted" to) is not
     counted here -- it is a no-op, handled later in _convert_directory -- so
     that an existing .md file does not itself register as a false collision.
+
+    fold_case should reflect whether output_dir's actual filesystem treats
+    case-differing names as the same file (see
+    _filesystem_is_case_insensitive); it decides whether e.g. Report.md and
+    report.md are treated as one output path or two here.
     """
     plan = []
     # normalized output path -> (display output path, [input paths])
     by_output: Dict[str, Tuple[str, List[str]]] = {}
-    for input_path, rel_path in _iter_input_files(input_dir, recursive, output_dir):
+    for input_path, rel_path in _iter_input_files(
+        input_dir, recursive, output_dir, fold_case
+    ):
         rel_md_path = os.path.splitext(rel_path)[0] + ".md"
         output_path = os.path.join(output_dir, rel_md_path)
         plan.append((input_path, output_path))
 
-        if _normalize_path(input_path) == _normalize_path(output_path):
+        if _normalize_path(input_path, fold_case) == _normalize_path(
+            output_path, fold_case
+        ):
             continue
 
-        key = _normalize_path(output_path)
+        key = _normalize_path(output_path, fold_case)
         display_path, inputs = by_output.get(key, (output_path, []))
         inputs.append(input_path)
         by_output[key] = (display_path, inputs)
@@ -426,13 +487,22 @@ def _convert_directory(markitdown: MarkItDown, args) -> None:
     except OSError as e:
         _exit_with_error(f"Could not create output directory {output_dir}: {e}")
 
-    plan = _build_conversion_plan(input_dir, output_dir, args.recursive)
+    # Determine once, against the real output filesystem, whether names
+    # differing only by case refer to the same file there -- rather than
+    # assuming that from the OS -- and use that consistently for every
+    # path comparison below (collision detection, self-output detection,
+    # and the recursive output-directory exclusion in _iter_input_files).
+    fold_case = _filesystem_is_case_insensitive(output_dir)
+
+    plan = _build_conversion_plan(input_dir, output_dir, args.recursive, fold_case)
 
     converted = 0
     failed = 0
     skipped = 0
     for input_path, output_path in plan:
-        if _normalize_path(input_path) == _normalize_path(output_path):
+        if _normalize_path(input_path, fold_case) == _normalize_path(
+            output_path, fold_case
+        ):
             # Input file is already the intended output (e.g., converting a
             # folder that already contains .md files, in place). Since the
             # collision check above guarantees no other input targets this
