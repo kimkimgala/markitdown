@@ -271,18 +271,46 @@ def test_filesystem_is_case_insensitive_probe_on_this_platform(tmp_path) -> None
             "test_directory_conversion_case_only_names_on_this_platform."
         )
     assert _filesystem_is_case_insensitive(str(tmp_path)) is False
+    # The probe must not leave its temporary file behind, success or not.
+    assert list(tmp_path.iterdir()) == []
 
 
-def test_filesystem_is_case_insensitive_returns_false_when_probe_cannot_run(
+def test_filesystem_is_case_insensitive_raises_when_probe_cannot_run(
     tmp_path, monkeypatch
 ) -> None:
+    # The probe must surface "I couldn't check" as a distinct outcome
+    # (raising) rather than collapsing it into "checked, and it's
+    # case-sensitive" (returning False) -- the caller decides what "unknown"
+    # means, instead of that ambiguity being baked into the return value.
     from markitdown.__main__ import _filesystem_is_case_insensitive
 
     def _raise(*args, **kwargs):
         raise OSError("simulated: directory not writable")
 
     monkeypatch.setattr(os, "open", _raise)
-    assert _filesystem_is_case_insensitive(str(tmp_path)) is False
+    with pytest.raises(OSError):
+        _filesystem_is_case_insensitive(str(tmp_path))
+    # os.open itself failed, so there is nothing to have created or left
+    # behind.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_filesystem_is_case_insensitive_cleans_up_probe_file_on_failure(
+    tmp_path, monkeypatch
+) -> None:
+    # If a later step in the probe (after the temp file was created) fails
+    # unexpectedly, the temp file must still be removed and the failure
+    # must still propagate rather than being swallowed into False.
+    from markitdown.__main__ import _filesystem_is_case_insensitive
+
+    def _raise(*args, **kwargs):
+        raise OSError("simulated: samefile failed unexpectedly")
+
+    monkeypatch.setattr(os.path, "exists", lambda path: True)
+    monkeypatch.setattr(os.path, "samefile", _raise)
+    with pytest.raises(OSError):
+        _filesystem_is_case_insensitive(str(tmp_path))
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_filesystem_is_case_insensitive_forced_true(tmp_path, monkeypatch) -> None:
@@ -296,6 +324,7 @@ def test_filesystem_is_case_insensitive_forced_true(tmp_path, monkeypatch) -> No
     monkeypatch.setattr(os.path, "exists", lambda path: True)
     monkeypatch.setattr(os.path, "samefile", lambda a, b: True)
     assert _filesystem_is_case_insensitive(str(tmp_path)) is True
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_directory_conversion_collision_when_filesystem_is_case_insensitive(
@@ -328,6 +357,78 @@ def test_directory_conversion_collision_when_filesystem_is_case_insensitive(
     assert "Report.md" in combined_output or "report.md" in combined_output
     assert not (tmp_path / "Report.md").exists()
     assert not (tmp_path / "report.md").exists()
+
+
+def test_directory_conversion_aborts_when_case_probe_fails(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    # If the case-sensitivity probe can't be carried out at all, the batch
+    # must refuse to convert -- not proceed as if the filesystem were
+    # case-sensitive, which is exactly the assumption that could let two
+    # case-differing inputs silently overwrite each other's output.
+    import markitdown.__main__ as md_main
+
+    (tmp_path / "a.html").write_text("<html><body><h1>Hello</h1></body></html>")
+    (tmp_path / "a.md").write_text("pre-existing content, must survive")
+
+    def _raise(*args, **kwargs):
+        raise OSError("simulated: directory not writable")
+
+    monkeypatch.setattr(md_main, "_filesystem_is_case_insensitive", _raise)
+    monkeypatch.setattr(sys, "argv", ["markitdown", str(tmp_path)])
+
+    with pytest.raises(SystemExit) as exc_info:
+        md_main.main()
+    assert exc_info.value.code == 1
+
+    captured = capsys.readouterr()
+    combined_output = captured.out + captured.err
+    # Names the output directory that couldn't be checked, and the reason.
+    assert str(tmp_path) in combined_output
+    assert "simulated: directory not writable" in combined_output
+
+    # Nothing was converted, and the pre-existing a.md was left untouched.
+    assert (tmp_path / "a.md").read_text() == "pre-existing content, must survive"
+    assert not (tmp_path / "Report.md").exists()
+
+
+def test_directory_conversion_aborts_when_case_probe_fails_subprocess(
+    tmp_path,
+) -> None:
+    # Same as test_directory_conversion_aborts_when_case_probe_fails, but
+    # via a real subprocess with a genuinely unwritable output directory
+    # (rather than a monkeypatched failure), so this doesn't rely on
+    # in-process monkeypatching to prove the CLI actually refuses to guess.
+    # Skipped when running as root, since root can write through the
+    # read-only permission bit this test relies on to make os.open fail.
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root can bypass the read-only permission bit this test relies on")
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (input_dir / "a.html").write_text("<html><body><h1>Hello</h1></body></html>")
+
+    output_dir.chmod(0o500)  # read + execute, no write
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "markitdown",
+                str(input_dir),
+                "-o",
+                str(output_dir),
+            ],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        output_dir.chmod(0o700)
+
+    assert result.returncode == 1
+    assert not (output_dir / "a.md").exists()
 
 
 def test_normalize_path_folds_case_only_like_windows_would(

@@ -323,34 +323,29 @@ def _filesystem_is_case_insensitive(directory: str) -> bool:
     `directory`, checks whether an upper-cased variant of that same name
     resolves to it too, and removes it again -- it never reads, creates,
     or removes any other file, so pre-existing files (including ones
-    already scheduled for conversion) are never touched. On any failure
-    (directory not writable, a permissions error, etc.) this conservatively
-    returns False, i.e. "assume case-sensitive, do not fold case" -- which
-    only means an unlikely, environment-specific collision might be missed
-    if the probe itself couldn't run, never that two genuinely distinct
-    files get incorrectly treated as colliding.
+    already scheduled for conversion) are never touched. The temp file is
+    always removed in a finally block, whether the check above it
+    succeeded or raised.
+
+    Raises OSError if the probe itself could not be carried out (e.g. the
+    directory is not writable, or some other permissions error). This is
+    deliberate: silently treating "couldn't check" the same as "checked
+    and it's case-sensitive" would mean a real collision on a filesystem
+    that IS case-insensitive could go undetected and let one input's
+    conversion silently overwrite another's output. Callers must decide
+    explicitly how to handle "unknown" -- see _convert_directory, which
+    refuses to convert rather than guessing.
     """
     probe_name = f".markitdown-case-probe-{uuid.uuid4().hex}"
     probe_path = os.path.join(directory, probe_name)
     variant_path = os.path.join(directory, probe_name.upper())
-    if probe_path == variant_path:
-        # Not reachable in practice (the ".markitdown-case-probe-" prefix
-        # always supplies letters for upper() to change), but avoid ever
-        # comparing a path against itself and calling that "insensitive".
-        return False
 
+    fd = os.open(probe_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     try:
-        fd = os.open(probe_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.close(fd)
-    except OSError:
-        return False
-
-    try:
         return os.path.exists(variant_path) and os.path.samefile(
             probe_path, variant_path
         )
-    except OSError:
-        return False
     finally:
         try:
             os.remove(probe_path)
@@ -492,7 +487,20 @@ def _convert_directory(markitdown: MarkItDown, args) -> None:
     # assuming that from the OS -- and use that consistently for every
     # path comparison below (collision detection, self-output detection,
     # and the recursive output-directory exclusion in _iter_input_files).
-    fold_case = _filesystem_is_case_insensitive(output_dir)
+    # If this can't be determined, refuse to convert rather than silently
+    # assuming case-sensitive: that assumption, if wrong, is exactly what
+    # would let two case-differing inputs silently overwrite one another.
+    try:
+        fold_case = _filesystem_is_case_insensitive(output_dir)
+    except OSError as e:
+        _exit_with_error(
+            f"Could not determine whether {output_dir} treats file names "
+            f"differing only by case as the same file: {e}. Refusing to "
+            "convert: files whose names differ only by case (e.g. "
+            "Report.md and report.md) could otherwise silently overwrite "
+            "each other's output without being detected as a collision. "
+            "No files were converted."
+        )
 
     plan = _build_conversion_plan(input_dir, output_dir, args.recursive, fold_case)
 
