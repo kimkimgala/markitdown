@@ -6,7 +6,7 @@ import os
 import sys
 import codecs
 import io
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 from textwrap import dedent
 from importlib.metadata import entry_points
 from .__about__ import __version__
@@ -24,6 +24,7 @@ def main():
 
                 markitdown <OPTIONAL: FILENAME>
                 If FILENAME is empty, markitdown reads from stdin.
+                If FILENAME is a directory, every file in it is converted to markdown.
 
             EXAMPLE:
 
@@ -44,6 +45,14 @@ def main():
                 OR
 
                 markitdown example.pdf > example.md
+
+                OR to convert every file in a folder use
+
+                markitdown path-to-folder -o path-to-output-folder
+
+                OR, to also recurse into subfolders
+
+                markitdown path-to-folder -o path-to-output-folder -r
             """
         ).strip(),
     )
@@ -59,7 +68,18 @@ def main():
     parser.add_argument(
         "-o",
         "--output",
-        help="Output file name. If not provided, output is written to stdout.",
+        help=(
+            "Output file name. If not provided, output is written to stdout. "
+            "If FILENAME is a directory, this is instead treated as the output "
+            "directory (defaults to FILENAME itself, converting files in place)."
+        ),
+    )
+
+    parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="When FILENAME is a directory, also convert files in its subdirectories.",
     )
 
     parser.add_argument(
@@ -248,6 +268,15 @@ def main():
     else:
         markitdown = MarkItDown(enable_plugins=args.use_plugins)
 
+    if args.filename is not None and os.path.isdir(args.filename):
+        if stream_info is not None:
+            _exit_with_error(
+                "The -x/--extension, -m/--mime-type, and -c/--charset hints "
+                "cannot be used when FILENAME is a directory."
+            )
+        _convert_directory(markitdown, args)
+        return
+
     if args.filename is None:
         # Windows pipe-backed stdin can report seekable() even though it cannot rewind.
         result = markitdown.convert_stream(
@@ -261,6 +290,71 @@ def main():
         )
 
     _handle_output(args, result)
+
+
+def _iter_input_files(
+    input_dir: str, recursive: bool, exclude_dir: str
+) -> List[Tuple[str, str]]:
+    """Yield (absolute_path, path_relative_to_input_dir) for files under input_dir.
+
+    exclude_dir (e.g. the output directory) is pruned from the walk so that
+    freshly-written output files are never picked back up as input.
+    """
+    abs_exclude_dir = os.path.abspath(exclude_dir)
+    results = []
+    if recursive:
+        for dirpath, dirnames, filenames in os.walk(input_dir):
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if os.path.abspath(os.path.join(dirpath, d)) != abs_exclude_dir
+            ]
+            for filename in sorted(filenames):
+                full_path = os.path.join(dirpath, filename)
+                results.append((full_path, os.path.relpath(full_path, input_dir)))
+    else:
+        for entry in sorted(os.listdir(input_dir)):
+            full_path = os.path.join(input_dir, entry)
+            if os.path.isfile(full_path):
+                results.append((full_path, entry))
+    return results
+
+
+def _convert_directory(markitdown: MarkItDown, args) -> None:
+    """Convert every file in args.filename (a directory) to a .md file."""
+    input_dir = args.filename
+    output_dir = args.output if args.output else input_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    converted = 0
+    failed = 0
+    for input_path, rel_path in _iter_input_files(
+        input_dir, args.recursive, output_dir
+    ):
+        rel_md_path = os.path.splitext(rel_path)[0] + ".md"
+        output_path = os.path.join(output_dir, rel_md_path)
+
+        if os.path.abspath(input_path) == os.path.abspath(output_path):
+            # Input file is already the intended output (e.g., converting a
+            # folder of .md files in place); nothing to do.
+            continue
+
+        try:
+            result = markitdown.convert(input_path, keep_data_uris=args.keep_data_uris)
+        except Exception as e:
+            print(f"[SKIPPED] {input_path}: {e}", file=sys.stderr)
+            failed += 1
+            continue
+
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(result.markdown)
+        print(f"{input_path} -> {output_path}")
+        converted += 1
+
+    print(f"\nConverted {converted} file(s), {failed} failed.", file=sys.stderr)
+    if failed > 0:
+        sys.exit(1)
 
 
 def _handle_output(args, result: DocumentConverterResult):

@@ -87,6 +87,22 @@ You can also pipe content:
 cat path-to-file.pdf | markitdown
 ```
 
+### Batch-Converting a Folder
+
+If you pass a folder instead of a file, every file directly inside it is converted to a `.md` file with the same base name:
+
+```bash
+markitdown path-to-folder
+```
+
+By default, the `.md` files are written next to the originals. Use `-o` to write them to a different folder instead, and add `-r`/`--recursive` to also convert files in subfolders (subfolder structure is preserved in the output folder):
+
+```bash
+markitdown path-to-folder -o path-to-output-folder -r
+```
+
+Files that fail to convert are skipped (a message is printed to stderr) rather than stopping the whole batch.
+
 ### Optional Dependencies
 MarkItDown has optional dependencies for activating various file formats. Earlier in this document, we installed all optional dependencies with the `[all]` option. However, you can also install them individually for more control. For example:
 
